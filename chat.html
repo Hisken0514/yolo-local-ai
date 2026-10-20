@@ -1,0 +1,80 @@
+<!doctype html>
+<html lang="zh-Hant">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>本地語言模型</title>
+<link rel="stylesheet" href="chat.css">
+</head>
+<body>
+<div class="app">
+  <aside>
+    <div>
+      <h1>本地語言模型</h1>
+      <div class="sub">在瀏覽器內執行，對話不會上傳　<a href="index.html">→ YOLO 鏡頭辨識</a></div>
+    </div>
+
+    <div>
+      <div class="label">預設模型</div>
+      <select id="preset">
+        <option value="onnx-community/SmolLM2-135M-Instruct-ONNX|q4">SmolLM2 135M（172 MB，手機用，英文為主）</option>
+        <option value="onnx-community/SmolLM2-360M-Instruct-ONNX|q4">SmolLM2 360M（369 MB，英文為主）</option>
+        <option value="onnx-community/Qwen2.5-0.5B-Instruct|q4">Qwen2.5 0.5B（756 MB，中文較好，電腦用）</option>
+      </select>
+    </div>
+
+    <div>
+      <div class="label">模型（Hugging Face ID）</div>
+      <input id="model" value="onnx-community/Qwen2.5-0.5B-Instruct" spellcheck="false">
+      <div class="hint">需要有 onnx 檔的文字生成模型（text-generation）</div>
+    </div>
+
+    <div class="two">
+      <div>
+        <div class="label">執行方式</div>
+        <select id="device">
+          <option value="webgpu">WebGPU（顯卡）</option>
+          <option value="wasm">Wasm（CPU）</option>
+        </select>
+      </div>
+      <div>
+        <div class="label">量化</div>
+        <select id="dtype">
+          <option value="q4">q4（小、快）</option>
+          <option value="q4f16">q4f16</option>
+          <option value="q8">q8</option>
+          <option value="fp16">fp16</option>
+          <option value="fp32">fp32</option>
+        </select>
+      </div>
+    </div>
+
+    <button id="load" class="primary">載入模型</button>
+    <div id="progress" hidden><div id="bar"></div></div>
+
+    <div>
+      <div class="label">最多產生字元（token）</div>
+      <input type="range" id="maxTok" min="32" max="1024" step="32" value="256">
+      <div class="row hint"><span></span><span id="maxTokV"></span></div>
+    </div>
+
+    <div class="big">
+      <div><b id="tps">-</b><span>tokens / 秒</span></div>
+      <div><b id="ttft">-</b><span>首字 ms</span></div>
+    </div>
+
+    <div id="status">尚未載入模型。第一次會下載模型檔，之後會存在瀏覽器快取。</div>
+  </aside>
+
+  <main>
+    <div id="log"></div>
+    <form id="form">
+      <textarea id="input" rows="2" placeholder="輸入訊息，Enter 送出，Shift+Enter 換行" disabled></textarea>
+      <button id="send" class="primary" disabled>送出</button>
+      <button id="stop" type="button" hidden>停止</button>
+    </form>
+  </main>
+</div>
+<script type="module" src="chat.js"></script>
+</body>
+</html>
