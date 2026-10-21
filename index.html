@@ -4,70 +4,105 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>YOLO 鏡頭辨識</title>
-<script src="https://cdn.jsdelivr.net/npm/onnxruntime-web@1.24.3/dist/ort.webgpu.min.js"></script>
+<script crossorigin="anonymous" src="https://cdn.jsdelivr.net/npm/onnxruntime-web@1.24.3/dist/ort.webgpu.min.js"></script>
 <link rel="stylesheet" href="style.css">
 </head>
 <body>
 <div class="app">
   <div class="stage">
     <canvas id="view"></canvas>
-    <div id="placeholder">選擇鏡頭後按「開始辨識」<br>第一次會詢問是否允許使用攝影機</div>
-  </div>
-  <aside>
-    <div>
-      <h1>YOLO 鏡頭辨識</h1>
-      <div class="sub">全部在你的電腦上運算，模型不會上傳　<a href="chat.html">→ 語言模型</a></div>
+    <div id="placeholder">
+      <b>開啟鏡頭，或把圖片／影片拖進來</b>
+      影像只在這台裝置上用 WebAssembly 運算，不會上傳
     </div>
+    <div id="hud" hidden><i></i><span id="hudText"></span></div>
+  </div>
 
-    <div>
+  <aside>
+    <header>
+      <h1>YOLO 鏡頭辨識</h1>
+      <div class="sub">ONNX Runtime 編譯成 WebAssembly，在瀏覽器裡跑物件偵測　<a href="chat.html">語言模型 →</a></div>
+      <div id="status">載入中…</div>
+    </header>
+
+    <section id="env" class="card">
+      <div class="label">執行環境</div>
+      <div class="chips"></div>
+      <div id="wasmFile" class="mono hint">尚未載入 .wasm</div>
+    </section>
+
+    <section>
+      <div class="label">輸入來源</div>
+      <select id="camera" aria-label="鏡頭"><option value="">（開啟後會列出所有鏡頭）</option></select>
+      <div class="two">
+        <button id="startCam" class="primary">開啟鏡頭</button>
+        <button id="pickMedia">圖片／影片…</button>
+      </div>
+      <input type="file" id="fileMedia" accept="image/*,video/*" hidden>
+    </section>
+
+    <section>
+      <div class="label">執行方式</div>
+      <div id="backend" class="backends">
+        <button data-b="wasm"><b>WebAssembly</b><span id="wasmSub">CPU</span></button>
+        <button data-b="webgpu"><b>WebGPU</b><span id="gpuSub">顯示卡</span></button>
+      </div>
+      <div class="threads">
+        <label for="threads">Wasm 執行緒</label>
+        <select id="threads"></select>
+      </div>
+      <div id="threadHint" class="hint">變更後會重新載入頁面（ONNX Runtime 初始化後就不能改）</div>
+    </section>
+
+    <section>
+      <div class="label">即時效能</div>
+      <div class="big">
+        <div><b id="fps">-</b><span>FPS</span></div>
+        <div><b id="inf">-</b><span>推論 ms</span></div>
+      </div>
+      <div class="pipe" aria-label="每一幀的時間分配">
+        <div class="pipe-bar"><i id="segPre" class="js"></i><i id="segInf" class="wasm"></i><i id="segPost" class="js2"></i></div>
+        <dl>
+          <dt><b class="sw js"></b>前處理 · JavaScript</dt><dd id="tPre">-</dd>
+          <dt><b class="sw wasm" id="infSw"></b><span id="infName">推論 · WebAssembly</span></dt><dd id="tInf">-</dd>
+          <dt><b class="sw js2"></b>後處理（NMS）· JavaScript</dt><dd id="tPost">-</dd>
+          <dt>輸入尺寸</dt><dd id="sizeV">-</dd>
+        </dl>
+      </div>
+    </section>
+
+    <section>
+      <div class="row label"><span>效能比較</span><button id="benchClear" class="link" hidden>清除紀錄</button></div>
+      <div class="two">
+        <button id="benchRun">Wasm 對 WebGPU</button>
+        <button id="benchThreads">比較執行緒數</button>
+      </div>
+      <div id="benchOut" class="bench"></div>
+      <div id="benchHint" class="hint">同一個模型、同一張畫面，每種方式連續推論最多 20 次取中位數；長條越長越快，「×」是比最慢的一種快幾倍。比較執行緒會自動重新載入頁面數次。</div>
+    </section>
+
+    <section>
+      <div class="row label"><span>信心門檻</span><span id="confV"></span></div>
+      <input type="range" id="conf" min="0.1" max="0.9" step="0.05" value="0.4" aria-label="信心門檻">
+    </section>
+
+    <section>
+      <div class="label">目前畫面中</div>
+      <div id="objects"><div class="muted">尚無</div></div>
+    </section>
+
+    <section>
       <div class="label">模型</div>
-      <div id="modelName" class="modelname">-</div>
-      <div class="seg" style="margin-top:6px">
+      <div id="modelName" class="mono modelname">-</div>
+      <div class="two">
         <button id="pickModel">上傳 .onnx</button>
         <button id="pickNames">類別名稱</button>
       </div>
-      <button id="resetModel" style="margin-top:6px" hidden>還原預設模型</button>
+      <button id="resetModel" hidden>還原預設模型</button>
       <input type="file" id="fileModel" accept=".onnx" hidden>
       <input type="file" id="fileNames" accept=".txt,.json,.yaml,.yml" hidden>
-      <div class="hint">也可以直接把 .onnx（和 .txt / .json / .yaml 類別檔）拖進視窗</div>
-    </div>
-
-    <div>
-      <div class="label">鏡頭</div>
-      <select id="camera"><option value="">（按開始後會列出所有鏡頭）</option></select>
-    </div>
-    <button id="start">開始辨識</button>
-
-    <div>
-      <div class="label">執行方式</div>
-      <div class="seg" id="backend">
-        <button data-b="webgpu">WebGPU（顯卡）</button>
-        <button data-b="wasm">Wasm（CPU）</button>
-      </div>
-    </div>
-
-    <div>
-      <div class="row label"><span>信心門檻</span><span id="confV"></span></div>
-      <input type="range" id="conf" min="0.1" max="0.9" step="0.05" value="0.4">
-    </div>
-
-    <div class="big">
-      <div><b id="fps">-</b><span>FPS</span></div>
-      <div><b id="inf">-</b><span>推論 ms</span></div>
-    </div>
-
-    <dl>
-      <dt>前處理</dt><dd id="tPre">-</dd>
-      <dt>後處理（NMS）</dt><dd id="tPost">-</dd>
-      <dt>輸入尺寸</dt><dd id="sizeV">-</dd>
-    </dl>
-
-    <div>
-      <div class="label">目前畫面中</div>
-      <div id="objects"><div style="color:var(--muted)">尚無</div></div>
-    </div>
-
-    <div id="status">載入中…</div>
+      <div class="hint">也可以把 .onnx（和 .txt / .json / .yaml 類別檔）拖進視窗</div>
+    </section>
   </aside>
 </div>
 

@@ -11,8 +11,14 @@
   <aside>
     <div>
       <h1>本地語言模型</h1>
-      <div class="sub">在瀏覽器內執行，對話不會上傳　<a href="index.html">→ YOLO 鏡頭辨識</a></div>
+      <div class="sub">Transformers.js 透過 WebAssembly／WebGPU 在瀏覽器內執行，對話不會上傳　<a href="index.html">→ YOLO 鏡頭辨識</a></div>
     </div>
+
+    <section id="env" class="card">
+      <div class="label">執行環境</div>
+      <div class="chips"></div>
+      <div id="wasmFile" class="hint mono">載入模型後會顯示實際下載的 .wasm</div>
+    </section>
 
     <div>
       <div class="label">預設模型</div>
@@ -34,7 +40,7 @@
         <div class="label">執行方式</div>
         <select id="device">
           <option value="webgpu">WebGPU（顯卡）</option>
-          <option value="wasm">Wasm（CPU）</option>
+          <option value="wasm">WebAssembly（CPU）</option>
         </select>
       </div>
       <div>
@@ -48,6 +54,12 @@
         </select>
       </div>
     </div>
+
+    <div class="threads">
+      <label for="threads">Wasm 執行緒</label>
+      <select id="threads"></select>
+    </div>
+    <div id="threadHint" class="hint"></div>
 
     <button id="load" class="primary">載入模型</button>
     <div id="progress" hidden><div id="bar"></div></div>

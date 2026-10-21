@@ -1,6 +1,24 @@
-import { pipeline, TextStreamer, InterruptableStoppingCriteria } from 'https://cdn.jsdelivr.net/npm/@huggingface/transformers@4.3.1';
+import { pipeline, TextStreamer, InterruptableStoppingCriteria, env } from 'https://cdn.jsdelivr.net/npm/@huggingface/transformers@4.3.1';
+import { ensureIsolation, detectEnv, renderEnv, renderWasmFiles, threads, threadChoices, setThreads } from './wasm-env.js';
 
 const $ = id => document.getElementById(id);
+
+// 多執行緒：和 YOLO 頁共用同一個設定；GitHub Pages 上第一次會自動重新整理一次以開啟隔離
+await ensureIsolation();
+const THREADS = threads();
+env.backends.onnx.wasm.numThreads = THREADS;
+
+detectEnv().then(info => {
+  renderEnv($('env'), info, THREADS);
+  const choices = threadChoices();
+  $('threads').innerHTML = choices.map(n => `<option value="${n}">${n} 個</option>`).join('');
+  $('threads').value = THREADS;
+  $('threads').disabled = choices.length < 2;
+  $('threadHint').textContent = !info.isolated
+    ? '頁面沒有跨來源隔離，Wasm 只能用 1 個執行緒。'
+    : `只影響 WebAssembly 模式。變更後會重新載入頁面。`;
+});
+$('threads').onchange = e => { setThreads(+e.target.value); location.reload(); };
 const setStatus = (t, err) => { $('status').textContent = t; $('status').classList.toggle('err', !!err); };
 
 let gen = null, loading = false, busy = false;
@@ -41,7 +59,9 @@ $('load').onclick = async () => {
         } else if (p.status === 'ready') setStatus('初始化中…');
       },
     });
-    setStatus(`已載入（${((performance.now() - t0) / 1000).toFixed(1)} 秒），${$('device').value} / ${$('dtype').value}`);
+    const dev = $('device').value === 'wasm' ? `WebAssembly × ${THREADS} 執行緒` : 'WebGPU';
+    setStatus(`已載入（${((performance.now() - t0) / 1000).toFixed(1)} 秒），${dev} / ${$('dtype').value}`);
+    renderWasmFiles($('wasmFile'));
     $('input').disabled = $('send').disabled = false; $('input').focus();
   } catch (e) {
     setStatus('載入失敗：' + (e.message || e), true);

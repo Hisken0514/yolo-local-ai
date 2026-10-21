@@ -1,3 +1,8 @@
+import {
+  ensureIsolation, detectEnv, renderEnv, renderWasmFiles, threads, threadChoices, setThreads,
+  getPref, setPref, getSession, setSession,
+} from './wasm-env.js';
+
 // ============================================================
 // 1. 模型來源：預設 YOLO11n（model.onnx），或使用者上傳（存在瀏覽器 IndexedDB，熱更新刷新後仍在）
 //    支援的輸出格式（自動判斷）：
@@ -16,6 +21,7 @@ let SIZE = 640;                                   // 模型輸入邊長，載入
 let modelBytes = null, modelLabel = '', outDims = null;
 const name = i => NAMES[i] ?? `類別 ${i}`;
 const color = i => `hsl(${(i * 47) % 360} 85% 58%)`;
+const esc = s => String(s).replace(/[&<>"']/g, c => `&#${c.charCodeAt(0)};`);
 
 // ---- IndexedDB：記住上傳的模型 ----
 const idb = () => new Promise((res, rej) => {
@@ -55,13 +61,18 @@ function namesFromOnnx(bytes) {
 }
 
 // ============================================================
-// 2. ONNX Runtime Web：同一個模型可以跑在 Wasm 或 WebGPU 上
+// 2. ONNX Runtime Web：C++ 推論引擎編譯成 WebAssembly；同一個模型可以跑在 Wasm（CPU）或 WebGPU（顯卡）
+//    執行緒數必須在第一次建立 session 前設定，之後要改只能重新整理頁面
 // ============================================================
+const THREADS = threads();
 ort.env.wasm.wasmPaths = 'https://cdn.jsdelivr.net/npm/onnxruntime-web@1.24.3/dist/';
-ort.env.wasm.numThreads = 1;   // 沒有跨來源隔離，不能用多執行緒
+ort.env.wasm.numThreads = THREADS;
 
-let session = null, backend = navigator.gpu ? 'webgpu' : 'wasm', switching = false;
+let ENV = null;                                   // detectEnv() 的結果
+let session = null, switching = false;
+let backend = getPref('yolo-backend') || (navigator.gpu ? 'webgpu' : 'wasm');
 let prep, pctx, input;
+const backendLabel = b => b === 'webgpu' ? 'WebGPU' : `WebAssembly · ${THREADS} 執行緒`;
 
 function inputSizeOf(s) {
   try {
@@ -109,26 +120,30 @@ function isF16(s) {
   try { const m = s.inputMetadata; return (Array.isArray(m) ? m[0] : m[s.inputNames[0]]).type === 'float16'; } catch { return false; }
 }
 
+const newSession = b => ort.InferenceSession.create(modelBytes, { executionProviders: [b], graphOptimizationLevel: 'all' });
+
 let inF16 = false;
 async function createSession(b) {
   switching = true;
-  setStatus(`建立 ${b === 'webgpu' ? 'WebGPU' : 'Wasm'} 推論環境中…`);
+  setStatus(`建立 ${b === 'webgpu' ? 'WebGPU' : 'WebAssembly'} 推論環境中…`, 'busy');
   try {
-    const s = await ort.InferenceSession.create(modelBytes, { executionProviders: [b], graphOptimizationLevel: 'all' });
+    const s = await newSession(b);
     const size = inputSizeOf(s), f16 = isF16(s);
     // 先跑一次暖機，第一次通常特別慢；順便取得輸出形狀
     const res = await s.run({ [s.inputNames[0]]: makeInput(new Float32Array(3 * size * size), size, f16) });
     outDims = res[s.outputNames[0]].dims;
     if (session) await session.release();
     session = s; backend = b; inF16 = f16; setSize(size);
-    setStatus(`使用 ${b === 'webgpu' ? 'WebGPU（顯卡）' : 'Wasm（CPU）'} 執行中`);
+    setPref('yolo-backend', b);
+    resetTimes();
+    setStatus(`使用 ${backendLabel(b)} 執行中`);
     return true;
   } catch (e) {
     setStatus(`${b} 無法使用：${e.message}`, true);
     if (b === 'webgpu' && !session) return createSession('wasm');
     return false;
   } finally {
-    switching = false; renderBackend();
+    switching = false; renderBackend(); renderWasmFiles($('wasmFile'));
   }
 }
 
@@ -139,7 +154,7 @@ async function applyModel(bytes, names, label) {
   if (!(await createSession(backend))) { ({ modelBytes, NAMES, modelLabel } = prev); return false; }
   NAMES = names ?? namesFromOnnx(bytes) ?? [];
   dets = [];
-  renderModel();
+  renderModel(); renderBench();
   return true;
 }
 
@@ -149,15 +164,77 @@ async function loadDefault() {
 }
 
 // ============================================================
-// 3. 前處理：鏡頭畫面 → 等比縮放貼到 SIZE×SIZE（不足補灰邊）→ Float32 CHW
+// 3. 輸入來源：鏡頭、影片檔（循環播放）、圖片（同一張圖反覆推論，方便量測）
 // ============================================================
-function preprocess(video) {
-  const vw = video.videoWidth, vh = video.videoHeight;
+let src = null;                                   // { el, kind: 'camera' | 'video' | 'image' }
+const camVideo = document.createElement('video'); camVideo.muted = true; camVideo.playsInline = true;
+let stream = null, fileVideo = null, fileUrl = null;
+
+const srcReady = () => !!src && (src.kind === 'image' || src.el.readyState >= 2);
+const srcSize = () => src.kind === 'image' ? [src.el.naturalWidth, src.el.naturalHeight] : [src.el.videoWidth, src.el.videoHeight];
+
+function useSource(el, kind) {
+  src = { el, kind }; dets = [];
+  const [w, h] = srcSize(); view.width = w; view.height = h;
+  $('placeholder').hidden = true; $('hud').hidden = false;
+}
+function stopCamera() { stream?.getTracks().forEach(t => t.stop()); stream = null; }
+function stopFile() {
+  if (fileVideo) { fileVideo.pause(); fileVideo.removeAttribute('src'); fileVideo.load(); fileVideo = null; }
+  if (fileUrl) { URL.revokeObjectURL(fileUrl); fileUrl = null; }
+}
+
+async function listCameras() {
+  const devs = (await navigator.mediaDevices.enumerateDevices()).filter(d => d.kind === 'videoinput');
+  const sel = $('camera'), cur = stream?.getVideoTracks()[0]?.getSettings().deviceId;
+  sel.innerHTML = devs.map((d, i) => `<option value="${esc(d.deviceId)}">${esc(d.label || '鏡頭 ' + (i + 1))}</option>`).join('');
+  if (cur) sel.value = cur;
+}
+
+async function startCamera(deviceId) {
+  stopCamera();
+  stream = await navigator.mediaDevices.getUserMedia({
+    video: deviceId ? { deviceId: { exact: deviceId }, width: { ideal: 1280 }, height: { ideal: 720 } }
+                    : { width: { ideal: 1280 }, height: { ideal: 720 } }, audio: false });
+  stopFile();
+  camVideo.srcObject = stream;
+  await camVideo.play();
+  useSource(camVideo, 'camera');
+  $('startCam').textContent = '重新開啟鏡頭';
+  await listCameras();
+}
+
+async function openMedia(file) {
+  const url = URL.createObjectURL(file);
+  try {
+    if (file.type.startsWith('image/')) {
+      const img = new Image(); img.src = url; await img.decode();
+      stopCamera(); stopFile(); fileUrl = url;
+      useSource(img, 'image');
+    } else {
+      const v = document.createElement('video'); v.muted = true; v.loop = true; v.playsInline = true; v.src = url;
+      await v.play();
+      stopCamera(); stopFile(); fileUrl = url; fileVideo = v;
+      useSource(v, 'video');
+    }
+    $('startCam').textContent = '開啟鏡頭';
+    setStatus(`使用檔案 ${file.name}`);
+  } catch (e) {
+    URL.revokeObjectURL(url);
+    setStatus(`無法開啟 ${file.name}：${e.message || '格式不支援'}`, true);
+  }
+}
+
+// ============================================================
+// 4. 前處理（JavaScript）：畫面 → 等比縮放貼到 SIZE×SIZE（不足補灰邊）→ Float32 CHW
+// ============================================================
+function preprocess(el) {
+  const [vw, vh] = srcSize();
   const scale = Math.min(SIZE / vw, SIZE / vh);
   const w = Math.round(vw * scale), h = Math.round(vh * scale);
   const dx = (SIZE - w) / 2, dy = (SIZE - h) / 2;
   pctx.fillStyle = 'rgb(114,114,114)'; pctx.fillRect(0, 0, SIZE, SIZE);
-  pctx.drawImage(video, dx, dy, w, h);
+  pctx.drawImage(el, dx, dy, w, h);
   const px = pctx.getImageData(0, 0, SIZE, SIZE).data;
   const area = SIZE * SIZE;
   for (let i = 0; i < area; i++) {               // RGBA 交錯排列 → R 平面、G 平面、B 平面
@@ -169,7 +246,7 @@ function preprocess(video) {
 }
 
 // ============================================================
-// 4. 後處理：依輸出形狀解碼 → 門檻篩選 → NMS 去掉重疊框
+// 5. 後處理（JavaScript）：依輸出形狀解碼 → 門檻篩選 → NMS 去掉重疊框
 // ============================================================
 function postprocess(out, conf, { scale, dx, dy }) {
   const d = outDims, back = (x1, y1, x2, y2, score, cls) =>
@@ -210,39 +287,16 @@ function iou(a, b) {
 }
 
 // ============================================================
-// 5. 鏡頭
-// ============================================================
-const video = document.createElement('video'); video.muted = true; video.playsInline = true;
-let stream = null;
-
-async function listCameras() {
-  const devs = (await navigator.mediaDevices.enumerateDevices()).filter(d => d.kind === 'videoinput');
-  const sel = $('camera'), cur = stream?.getVideoTracks()[0]?.getSettings().deviceId;
-  sel.innerHTML = devs.map((d, i) => `<option value="${d.deviceId}">${d.label || '鏡頭 ' + (i + 1)}</option>`).join('');
-  if (cur) sel.value = cur;
-}
-
-async function startCamera(deviceId) {
-  stream?.getTracks().forEach(t => t.stop());
-  stream = await navigator.mediaDevices.getUserMedia({
-    video: deviceId ? { deviceId: { exact: deviceId }, width: { ideal: 1280 }, height: { ideal: 720 } }
-                    : { width: { ideal: 1280 }, height: { ideal: 720 } }, audio: false });
-  video.srcObject = stream;
-  await video.play();
-  view.width = video.videoWidth; view.height = video.videoHeight;
-  $('placeholder').hidden = true;
-  await listCameras();
-}
-
-// ============================================================
-// 6. 主迴圈：畫面每幀都畫；推論做完一次才做下一次
+// 6. 主迴圈：畫面每幀都畫；推論做完一次才做下一次。效能測試時暫停
 // ============================================================
 const view = $('view'), vctx = view.getContext('2d');
-let dets = [], busy = false, frames = 0, lastFps = performance.now();
+let dets = [], busy = false, paused = false, frames = 0, lastFps = performance.now(), fps = 0;
 
 function draw() {
-  if (video.readyState >= 2) {
-    vctx.drawImage(video, 0, 0);
+  if (srcReady()) {
+    const [w, h] = srcSize();
+    if (w && (view.width !== w || view.height !== h)) { view.width = w; view.height = h; }   // 手機轉向時鏡頭尺寸會變
+    vctx.drawImage(src.el, 0, 0, view.width, view.height);
     const lw = Math.max(2, view.width / 400), fs = Math.max(14, view.width / 50);
     vctx.lineWidth = lw; vctx.font = `600 ${fs}px system-ui, sans-serif`; vctx.textBaseline = 'top';
     for (const d of dets) {
@@ -257,53 +311,224 @@ function draw() {
 }
 
 async function detectLoop() {
-  if (session && !switching && !busy && video.readyState >= 2) {
+  if (session && !switching && !paused && !busy && srcReady()) {
     busy = true;
     const s = session, f16 = inF16;
     try {
       const t0 = performance.now();
-      const meta = preprocess(video);
+      const meta = preprocess(src.el);
       const t1 = performance.now();
       const res = await s.run({ [s.inputNames[0]]: makeInput(input, SIZE, f16) });
       const out = toF32(res[s.outputNames[0]].data);
       const t2 = performance.now();
       dets = s === session ? postprocess(out, +$('conf').value, meta) : [];
       const t3 = performance.now();
-      $('tPre').textContent = (t1 - t0).toFixed(1) + ' ms';
-      $('inf').textContent = (t2 - t1).toFixed(0);
-      $('tPost').textContent = (t3 - t2).toFixed(1) + ' ms';
+      renderTimes(t1 - t0, t2 - t1, t3 - t2);
       renderObjects();
       frames++;
     } catch (e) { setStatus('推論錯誤：' + e.message, true); }
     busy = false;
   }
   const now = performance.now();
-  if (now - lastFps > 1000) { $('fps').textContent = (frames * 1000 / (now - lastFps)).toFixed(1); frames = 0; lastFps = now; }
+  if (now - lastFps > 1000) {
+    fps = frames * 1000 / (now - lastFps); frames = 0; lastFps = now;
+    $('fps').textContent = paused || !srcReady() ? '-' : fps.toFixed(1);
+    renderHud();
+  }
   setTimeout(detectLoop, 0);
 }
 
+async function pauseLoop() { paused = true; while (busy) await new Promise(r => setTimeout(r, 10)); }
+function resumeLoop() { paused = false; }
+
 // ============================================================
-// 7. 介面
+// 7. 效能比較：同一個模型與畫面，換執行方式連續推論，取中位數
+// ============================================================
+const BENCH_KEY = 'yolo-bench', PLAN_KEY = 'yolo-thread-plan';
+let benchHist = (() => { try { return JSON.parse(getPref(BENCH_KEY)) || []; } catch { return []; } })();
+let benching = false;
+
+function benchData(size) {
+  if (srcReady() && size === SIZE) { preprocess(src.el); return input.slice(); }
+  const d = new Float32Array(3 * size * size);                    // 沒有畫面時用隨機雜訊：推論時間和內容無關
+  for (let i = 0; i < d.length; i++) d[i] = Math.random();
+  return d;
+}
+
+// 至少 5 次、最多 20 次，或每種方式花滿約 6 秒為止
+async function benchBackend(b, tag) {
+  const s = await newSession(b);
+  try {
+    const size = inputSizeOf(s), f16 = isF16(s), data = benchData(size);
+    const feed = () => ({ [s.inputNames[0]]: makeInput(data, size, f16) });
+    for (let i = 0; i < 2; i++) await s.run(feed());            // 暖機
+    const ts = [], start = performance.now();
+    while (ts.length < 20 && (ts.length < 5 || performance.now() - start < 6000)) {
+      const t = performance.now(); await s.run(feed()); ts.push(performance.now() - t);
+      setStatus(`效能測試：${tag || backendLabel(b)}　${ts.length} 次`, 'busy');
+    }
+    ts.sort((a, c) => a - c);
+    return { median: ts[ts.length >> 1], runs: ts.length };
+  } finally { await s.release(); }
+}
+
+function record(b, r) {
+  benchHist.push({ model: modelLabel, backend: b, threads: b === 'wasm' ? THREADS : 0, gpu: b === 'webgpu' ? ENV?.gpu || '' : '', median: r.median, runs: r.runs, at: Date.now() });
+  benchHist = benchHist.slice(-40);
+  setPref(BENCH_KEY, JSON.stringify(benchHist));
+  renderBench();
+}
+
+async function runBenchmark() {
+  if (benching || !modelBytes) return;
+  benching = true; renderBenchButtons(); await pauseLoop();
+  try {
+    const list = ['wasm', ...(ENV?.webgpu ? ['webgpu'] : [])], res = {};
+    for (const b of list) { res[b] = await benchBackend(b); record(b, res[b]); }
+    if (res.webgpu) {
+      const fast = res.webgpu.median < res.wasm.median ? 'webgpu' : 'wasm', slow = fast === 'wasm' ? 'webgpu' : 'wasm';
+      setStatus(`${backendLabel(fast)} 比 ${backendLabel(slow)} 快 ${(res[slow].median / res[fast].median).toFixed(1)} 倍`);
+    } else setStatus(`${backendLabel('wasm')}：每次推論 ${res.wasm.median.toFixed(0)} ms（這個瀏覽器沒有 WebGPU 可比較）`);
+  } catch (e) { setStatus('效能比較失敗：' + e.message, true); }
+  benching = false; renderBenchButtons(); resumeLoop();
+}
+
+// 執行緒比較：執行緒數只能在初始化前設定，所以每一步都設定後重新整理頁面，結果暫存在 sessionStorage
+function startThreadPlan() {
+  const steps = [1, 2, 4, 8].filter(n => threadChoices().includes(n));
+  if (steps.length < 2) return;
+  setSession(PLAN_KEY, { orig: THREADS, steps, i: 0, results: [] });
+  setThreads(steps[0]); location.reload();
+}
+
+async function continueThreadPlan() {
+  const plan = getSession(PLAN_KEY);
+  if (!plan) return;
+  if (plan.done) { setSession(PLAN_KEY, null); showThreadSummary(plan); return; }
+  const want = plan.steps[plan.i];
+  if (THREADS !== want) { setSession(PLAN_KEY, null); setThreads(plan.orig); setStatus(`執行緒比較中斷：無法切換到 ${want} 個執行緒`, true); return; }
+
+  benching = true; renderBenchButtons(); await pauseLoop();
+  try {
+    const r = await benchBackend('wasm', `WebAssembly · ${want} 執行緒（${plan.i + 1}/${plan.steps.length}）`);
+    record('wasm', r); plan.results.push({ threads: want, median: r.median });
+  } catch (e) {
+    setSession(PLAN_KEY, null); setThreads(plan.orig);
+    setStatus('執行緒比較失敗：' + e.message, true);
+    benching = false; renderBenchButtons(); resumeLoop(); return;
+  }
+  plan.i++;
+  if (plan.i < plan.steps.length) { setSession(PLAN_KEY, plan); setThreads(plan.steps[plan.i]); location.reload(); return; }
+  plan.done = true; setThreads(plan.orig);
+  if (plan.orig !== THREADS) { setSession(PLAN_KEY, plan); location.reload(); return; }
+  setSession(PLAN_KEY, null); showThreadSummary(plan);
+  benching = false; renderBenchButtons(); resumeLoop();
+}
+
+function showThreadSummary(plan) {
+  const one = plan.results.find(r => r.threads === 1), best = plan.results.reduce((m, r) => r.median < m.median ? r : m);
+  if (!one || best === one) { setStatus('執行緒比較完成：多執行緒在這台裝置上沒有變快'); return; }
+  setStatus(`執行緒比較完成：1 個執行緒 ${one.median.toFixed(0)} ms → ${best.threads} 個執行緒 ${best.median.toFixed(0)} ms，快 ${(one.median / best.median).toFixed(1)} 倍`);
+}
+
+// ============================================================
+// 8. 介面
 // ============================================================
 function $(id) { return document.getElementById(id); }
-function setStatus(t, err) { $('status').textContent = t; $('status').classList.toggle('err', !!err); }
-function renderBackend() { document.querySelectorAll('#backend button').forEach(b => b.classList.toggle('on', b.dataset.b === backend)); }
+function setStatus(t, kind) {
+  const s = $('status'); s.textContent = t;
+  s.classList.toggle('err', kind === true); s.classList.toggle('busy', kind === 'busy');
+}
+
+function renderBackend() {
+  document.querySelectorAll('#backend button').forEach(b => b.classList.toggle('on', b.dataset.b === backend));
+  $('wasmSub').textContent = `CPU · ${THREADS} 執行緒`;
+  if (ENV) {
+    const gpuBtn = document.querySelector('#backend [data-b=webgpu]');
+    gpuBtn.disabled = !ENV.webgpu;
+    $('gpuSub').textContent = ENV.webgpu ? (ENV.gpu || '顯示卡') : '這個瀏覽器不支援';
+  }
+  const gpu = backend === 'webgpu';
+  $('segInf').className = $('infSw').className = gpu ? 'gpu' : 'wasm';
+  $('infSw').classList.add('sw');
+  $('infName').textContent = `推論 · ${gpu ? 'WebGPU' : `WebAssembly ×${THREADS}`}`;
+  $('hud').classList.toggle('gpu', gpu);
+  renderHud();
+}
+
+function renderThreads() {
+  const choices = threadChoices(), sel = $('threads');
+  sel.innerHTML = choices.map(n => `<option value="${n}">${n} 個${n === 1 ? '（單執行緒）' : ''}</option>`).join('');
+  sel.value = THREADS;
+  sel.disabled = choices.length < 2 || benching;
+  $('threadHint').textContent = !ENV?.isolated
+    ? '這個頁面沒有跨來源隔離，瀏覽器不開放多執行緒，Wasm 只能用 1 個執行緒。'
+    : choices.length < 2 ? '這台裝置只有 1 個 CPU 核心。'
+    : `這台裝置有 ${ENV.cores} 個邏輯核心。變更後會重新載入頁面（ONNX Runtime 初始化後就不能改）。`;
+}
+
+// 平滑後的每幀時間
+const ema = {};
+const smooth = (k, v) => (ema[k] = ema[k] == null ? v : ema[k] * 0.8 + v * 0.2);
+function resetTimes() { for (const k in ema) delete ema[k]; }
+function renderTimes(pre, inf, post) {
+  pre = smooth('pre', pre); inf = smooth('inf', inf); post = smooth('post', post);
+  const total = pre + inf + post;
+  $('segPre').style.width = (pre / total * 100) + '%';
+  $('segInf').style.width = (inf / total * 100) + '%';
+  $('segPost').style.width = (post / total * 100) + '%';
+  $('tPre').textContent = pre.toFixed(1) + ' ms';
+  $('tInf').textContent = inf.toFixed(1) + ' ms';
+  $('tPost').textContent = post.toFixed(1) + ' ms';
+  $('inf').textContent = inf.toFixed(0);
+}
+function renderHud() {
+  const inf = ema.inf;
+  $('hudText').textContent = `${backendLabel(backend)}${inf ? ` · ${inf.toFixed(0)} ms` : ''}${fps && !paused ? ` · ${fps.toFixed(1)} FPS` : ''}`;
+}
+
 function renderModel() {
   const nc = outDims ? (outDims[2] === 6 && outDims[1] <= 1000 ? NAMES.length : Math.min(outDims[1], outDims[2]) - 4) : NAMES.length;
   const hasNames = NAMES.length >= nc;
   $('modelName').textContent = `${modelLabel}${inF16 ? '（fp16）' : ''}　${nc} 類${hasNames ? '' : '（缺類別名稱，顯示為「類別 N」）'}`;
   $('resetModel').hidden = modelLabel.startsWith('YOLO11n');
 }
+
 function renderObjects() {
   const count = {};
   for (const d of dets) count[d.cls] = (count[d.cls] || 0) + 1;
   const keys = Object.keys(count).sort((a, b) => count[b] - count[a]);
   $('objects').innerHTML = keys.length
-    ? keys.map(k => `<div><span><i style="background:${color(k)}"></i>${name(k)}</span><b>${count[k]}</b></div>`).join('')
-    : '<div style="color:var(--muted)">沒有偵測到物品</div>';
+    ? keys.map(k => `<div><span><i style="background:${color(k)}"></i>${esc(name(k))}</span><b>${count[k]}</b></div>`).join('')
+    : '<div class="muted">沒有偵測到物品</div>';
 }
 
-// ---- 上傳 ----
+// 每種設定只顯示最新一筆；長條越長越快，「×」= 比最慢的一種快幾倍
+function renderBench() {
+  const latest = new Map();
+  for (const r of benchHist) if (r.model === modelLabel) latest.set(`${r.backend}|${r.threads}`, r);
+  const rows = [...latest.values()].sort((a, b) => a.median - b.median);
+  $('benchClear').hidden = !rows.length;
+  if (!rows.length) { $('benchOut').innerHTML = ''; return; }
+  const best = rows[0].median, worst = rows.at(-1).median;
+  $('benchOut').innerHTML = rows.map(r => {
+    const label = r.backend === 'webgpu' ? `WebGPU${r.gpu ? ' · ' + esc(r.gpu) : ''}` : `WebAssembly · ${r.threads} 執行緒`;
+    const x = worst / r.median;
+    return `<div class="bench-row ${r.backend}">
+      <span class="name">${label}${rows.length > 1 && x >= 1.05 ? `<span class="x">×${x.toFixed(1)}</span>` : ''}</span>
+      <span class="val">${(1000 / r.median).toFixed(1)} 次/秒 <small>${r.median.toFixed(0)} ms</small></span>
+      <span class="track"><i style="width:${(best / r.median * 100).toFixed(1)}%"></i></span>
+    </div>`;
+  }).join('');
+}
+function renderBenchButtons() {
+  $('benchRun').disabled = benching;
+  $('benchThreads').disabled = benching || [1, 2, 4, 8].filter(n => threadChoices().includes(n)).length < 2;
+  $('benchThreads').title = $('benchThreads').disabled && !benching ? '需要跨來源隔離和 2 個以上的 CPU 核心' : '';
+  $('threads').disabled = benching || threadChoices().length < 2;
+}
+
+// ---- 上傳模型 ----
 async function handleFiles(files) {
   let model = null, names = null;
   for (const f of files) {
@@ -311,11 +536,11 @@ async function handleFiles(files) {
     else if (/\.(txt|json|ya?ml)$/i.test(f.name)) names = f;
     else if (/\.(pt|pth|engine|tflite)$/i.test(f.name)) { setStatus(`${f.name} 不能直接在瀏覽器跑，請先匯出成 ONNX：yolo export model=${f.name} format=onnx`, true); return; }
   }
-  if (!model && !names) { setStatus('請選 .onnx 模型，或 .txt/.json/.yaml 類別檔', true); return; }
+  if (!model && !names) { setStatus('請選 .onnx 模型、.txt/.json/.yaml 類別檔，或圖片／影片', true); return; }
 
   const parsedNames = names ? parseNames(await names.text()) : null;
   if (model) {
-    setStatus(`載入 ${model.name}…`);
+    setStatus(`載入 ${model.name}…`, 'busy');
     const bytes = new Uint8Array(await model.arrayBuffer());
     if (!(await applyModel(bytes, parsedNames, model.name))) return;
     await idbSet('model', { bytes: bytes.buffer, names: NAMES, label: model.name }).catch(() => setStatus('模型太大，無法記住（重新整理後需重傳）', true));
@@ -326,34 +551,57 @@ async function handleFiles(files) {
   }
 }
 
+const isMedia = f => /^(image|video)\//.test(f.type);
+function handleDrop(files) {
+  const media = files.find(isMedia), rest = files.filter(f => !isMedia(f));
+  if (media) openMedia(media);
+  if (rest.length) handleFiles(rest);
+}
+
 $('pickModel').onclick = () => $('fileModel').click();
 $('pickNames').onclick = () => $('fileNames').click();
+$('pickMedia').onclick = () => $('fileMedia').click();
 $('fileModel').onchange = e => { handleFiles([...e.target.files]); e.target.value = ''; };
 $('fileNames').onchange = e => { handleFiles([...e.target.files]); e.target.value = ''; };
+$('fileMedia').onchange = e => { if (e.target.files[0]) openMedia(e.target.files[0]); e.target.value = ''; };
 $('resetModel').onclick = async () => { await idbDel('model'); await loadDefault(); };
 addEventListener('dragover', e => { e.preventDefault(); document.body.classList.add('drag'); });
 addEventListener('dragleave', e => { if (!e.relatedTarget) document.body.classList.remove('drag'); });
-addEventListener('drop', e => { e.preventDefault(); document.body.classList.remove('drag'); handleFiles([...e.dataTransfer.files]); });
+addEventListener('drop', e => { e.preventDefault(); document.body.classList.remove('drag'); handleDrop([...e.dataTransfer.files]); });
 
 $('conf').oninput = () => $('confV').textContent = (+$('conf').value * 100).toFixed(0) + '%';
 $('conf').oninput();
 
-$('start').onclick = async () => {
-  try { await startCamera($('camera').value); $('start').textContent = '重新啟動鏡頭'; }
+$('startCam').onclick = async () => {
+  try { await startCamera($('camera').value); }
   catch (e) { setStatus('無法開啟鏡頭：' + e.message + '（請確認已允許攝影機權限，且沒有其他程式占用）', true); }
 };
 $('camera').onchange = () => { if (stream) startCamera($('camera').value).catch(e => setStatus(e.message, true)); };
 $('backend').onclick = e => {
-  const b = e.target.closest('button'); if (!b || b.dataset.b === backend || switching) return;
-  if (b.dataset.b === 'webgpu' && !navigator.gpu) { setStatus('這個瀏覽器不支援 WebGPU', true); return; }
+  const b = e.target.closest('button'); if (!b || b.disabled || b.dataset.b === backend || switching || benching) return;
   createSession(b.dataset.b);
 };
+$('threads').onchange = e => { setThreads(+e.target.value); location.reload(); };
+$('benchRun').onclick = runBenchmark;
+$('benchThreads').onclick = startThreadPlan;
+$('benchClear').onclick = () => { benchHist = benchHist.filter(r => r.model !== modelLabel); setPref(BENCH_KEY, JSON.stringify(benchHist)); renderBench(); };
 
-renderBackend();
+// ============================================================
+// 9. 啟動
+// ============================================================
 (async () => {
+  if (await ensureIsolation()) return;            // GitHub Pages：註冊 service worker 後會重新整理一次
+  ENV = await detectEnv();
+  if (backend === 'webgpu' && !ENV.webgpu) backend = 'wasm';
+  renderEnv($('env'), ENV, THREADS);
+  renderThreads(); renderBackend(); renderBenchButtons();
+  if (getSession(PLAN_KEY)) setStatus('比較執行緒數中，載入模型…', 'busy');
+
   const saved = await idbGet('model').catch(() => null);          // 上次上傳的模型優先
   let ok = false;
   if (saved) ok = await applyModel(new Uint8Array(saved.bytes), saved.names?.length ? saved.names : null, saved.label);
   if (!ok) ok = await loadDefault();
-  if (ok) { detectLoop(); draw(); }
+  if (!ok) return;
+  draw(); detectLoop();
+  await continueThreadPlan();
 })();

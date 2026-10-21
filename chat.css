@@ -39,3 +39,16 @@ form button { width: 80px; }
   aside { border-right: 0; border-bottom: 1px solid var(--line); max-height: 45vh; }
 }
 a { color: var(--accent); }
+[hidden] { display: none !important; }
+
+/* 執行環境（與 YOLO 頁相同） */
+.card { background: #11161a; border: 1px solid var(--line); border-radius: 10px; padding: 12px; display: flex; flex-direction: column; gap: 8px; }
+.mono { font-family: var(--mono); }
+.chips { display: flex; flex-wrap: wrap; gap: 6px; }
+.chip { display: inline-flex; align-items: center; gap: 6px; padding: 4px 9px; border-radius: 999px; font-size: 12px; border: 1px solid var(--line); background: var(--panel); cursor: help; }
+.chip i { width: 7px; height: 7px; border-radius: 50%; background: #5d6772; }
+.chip.ok i { background: var(--accent); }
+.chip.no { color: var(--muted); }
+#wasmFile { word-break: break-all; font-size: 11px; }
+.threads { display: grid; grid-template-columns: auto 1fr; align-items: center; gap: 10px; }
+.threads label { color: var(--muted); font-size: 12px; }

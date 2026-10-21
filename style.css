@@ -1,41 +1,114 @@
-﻿:root {
-    --bg: #0e1114; --panel: #171c21; --fg: #e8edf1; --muted: #8a97a3; --line: #29313a;
-    --accent: #2ee6a6; --accent-fg: #062018; --warn: #ffb35c; --mono: ui-monospace, Consolas, monospace;
-  }
-  * { box-sizing: border-box; }
-  html, body { margin: 0; height: 100%; background: var(--bg); color: var(--fg); font-family: system-ui, "Microsoft JhengHei", sans-serif; font-size: 13px; }
-  .app { display: grid; grid-template-columns: 1fr 300px; height: 100%; }
-  .stage { position: relative; display: grid; place-items: center; background: #000; min-width: 0; min-height: 0; overflow: hidden; }
-  /* 撐滿容器並等比縮放：直式鏡頭畫面也不會超出容器去蓋住下面的控制區 */
-  canvas#view { position: absolute; inset: 0; width: 100%; height: 100%; object-fit: contain; }
-  #placeholder { position: absolute; color: var(--muted); text-align: center; line-height: 1.8; padding: 16px; }
-  aside { background: var(--panel); border-left: 1px solid var(--line); padding: 16px; overflow-y: auto; display: flex; flex-direction: column; gap: 16px; }
-  h1 { font-size: 16px; margin: 0; }
-  .sub { color: var(--muted); font-size: 12px; margin-top: 2px; }
-  .label { color: var(--muted); font-size: 11px; letter-spacing: .06em; margin-bottom: 6px; }
-  select, button { width: 100%; background: #20272e; color: var(--fg); border: 1px solid var(--line); border-radius: 6px; padding: 8px; font-size: 13px; }
-  button { cursor: pointer; }
-  #start { background: var(--accent); color: var(--accent-fg); border-color: var(--accent); font-weight: 700; }
-  .seg { display: grid; grid-template-columns: 1fr 1fr; gap: 6px; }
-  .seg button.on { background: var(--accent); color: var(--accent-fg); border-color: var(--accent); font-weight: 600; }
-  input[type=range] { width: 100%; accent-color: var(--accent); }
-  .row { display: flex; justify-content: space-between; }
-  .big { display: grid; grid-template-columns: 1fr 1fr; gap: 8px; }
-  .big div { background: #11161a; border: 1px solid var(--line); border-radius: 8px; padding: 8px 10px; }
-  .big b { display: block; font-size: 24px; font-family: var(--mono); font-variant-numeric: tabular-nums; }
-  .big span { color: var(--muted); font-size: 11px; }
-  dl { display: grid; grid-template-columns: auto 1fr; gap: 3px 10px; margin: 0; }
-  dt { color: var(--muted); } dd { margin: 0; text-align: right; font-family: var(--mono); font-variant-numeric: tabular-nums; }
-  #objects { display: flex; flex-direction: column; gap: 4px; }
-  #objects div { display: flex; justify-content: space-between; padding: 4px 8px; border-radius: 4px; background: #11161a; }
-  #objects i { display: inline-block; width: 10px; height: 10px; border-radius: 2px; margin-right: 6px; vertical-align: -1px; }
-  .modelname { font-family: var(--mono); font-size: 12px; word-break: break-all; }
-  .hint { color: var(--muted); font-size: 11px; margin-top: 6px; line-height: 1.5; }
-  body.drag .stage { outline: 3px dashed var(--accent); outline-offset: -12px; }
-  #status { color: var(--muted); font-size: 12px; }
-  #status.err { color: var(--warn); }
-  @media (max-width: 760px) {
-    .app { grid-template-columns: 1fr; grid-template-rows: 45vh auto; grid-template-rows: 45dvh auto; height: auto; }
-    aside { border-left: 0; border-top: 1px solid var(--line); }
-  }
+﻿/* 版面：左邊畫面、右邊控制欄；手機改成上畫面、下控制欄。
+   顏色用來區分「誰在算」：紫 = WebAssembly、藍 = WebGPU、黃 = JavaScript */
+:root {
+  --bg: #0d1013; --panel: #151a1f; --panel2: #1c2229; --fg: #e8edf1; --muted: #8b97a3; --line: #283039;
+  --accent: #2ee6a6; --accent-fg: #062018; --warn: #ffb35c;
+  --wasm: #8b7bff; --gpu: #45b6ff; --js: #e8c547; --js2: #b89a2e; --off: #5d6772;
+  --mono: ui-monospace, "Cascadia Mono", Consolas, monospace;
+  color-scheme: dark;
+}
+* { box-sizing: border-box; }
+[hidden] { display: none !important; }
+html, body { margin: 0; height: 100%; background: var(--bg); color: var(--fg); font-family: system-ui, "Microsoft JhengHei", "PingFang TC", sans-serif; font-size: 13px; }
 a { color: var(--accent); }
+.app { display: grid; grid-template-columns: 1fr 340px; height: 100%; }
+
+/* ---- 畫面 ---- */
+.stage { position: relative; display: grid; place-items: center; background: #000; min-width: 0; min-height: 0; overflow: hidden; }
+/* 撐滿容器並等比縮放：直式鏡頭畫面也不會超出容器去蓋住下面的控制區 */
+canvas#view { position: absolute; inset: 0; width: 100%; height: 100%; object-fit: contain; }
+#placeholder { position: absolute; color: var(--muted); text-align: center; line-height: 1.8; padding: 16px; max-width: 360px; }
+#placeholder b { display: block; color: var(--fg); font-size: 15px; margin-bottom: 4px; }
+body.drag .stage { outline: 3px dashed var(--accent); outline-offset: -12px; }
+#hud { position: absolute; top: 12px; left: 12px; display: flex; align-items: center; gap: 8px; padding: 6px 10px;
+  background: rgb(0 0 0 / .62); border: 1px solid rgb(255 255 255 / .12); border-radius: 999px;
+  font: 600 12px var(--mono); font-variant-numeric: tabular-nums; backdrop-filter: blur(6px); }
+#hud i { width: 8px; height: 8px; border-radius: 50%; background: var(--wasm); box-shadow: 0 0 8px var(--wasm); }
+#hud.gpu i { background: var(--gpu); box-shadow: 0 0 8px var(--gpu); }
+
+/* ---- 控制欄 ---- */
+aside { background: var(--panel); border-left: 1px solid var(--line); padding: 16px; overflow-y: auto; display: flex; flex-direction: column; gap: 18px; }
+section, header { display: flex; flex-direction: column; gap: 8px; }
+h1 { font-size: 16px; margin: 0; }
+.sub, .hint { color: var(--muted); font-size: 12px; line-height: 1.55; }
+.hint { font-size: 11px; }
+.muted { color: var(--muted); }
+.mono { font-family: var(--mono); }
+.label { color: var(--muted); font-size: 11px; letter-spacing: .06em; }
+.row { display: flex; justify-content: space-between; align-items: center; }
+.two { display: grid; grid-template-columns: 1fr 1fr; gap: 6px; }
+.card { background: var(--panel2); border: 1px solid var(--line); border-radius: 10px; padding: 12px; }
+
+select, button { width: 100%; background: var(--panel2); color: var(--fg); border: 1px solid var(--line); border-radius: 6px; padding: 8px; font: inherit; }
+button { cursor: pointer; }
+button:hover:not(:disabled) { border-color: #3a4450; }
+button:disabled, select:disabled { opacity: .5; cursor: default; }
+button:focus-visible, select:focus-visible, input:focus-visible { outline: 2px solid var(--accent); outline-offset: 1px; }
+.primary { background: var(--accent); color: var(--accent-fg); border-color: var(--accent); font-weight: 700; }
+.link { width: auto; background: none; border: 0; padding: 0; color: var(--muted); font-size: 11px; text-decoration: underline; }
+input[type=range] { width: 100%; accent-color: var(--accent); }
+
+#status { font-size: 12px; color: var(--muted); line-height: 1.5; white-space: pre-wrap; }
+#status.err { color: var(--warn); }
+#status.busy { color: var(--wasm); }
+
+/* 執行環境 chips */
+.chips { display: flex; flex-wrap: wrap; gap: 6px; }
+.chip { display: inline-flex; align-items: center; gap: 6px; padding: 4px 9px; border-radius: 999px; font-size: 12px;
+  border: 1px solid var(--line); background: var(--panel); cursor: help; }
+.chip i { width: 7px; height: 7px; border-radius: 50%; background: var(--off); }
+.chip.ok i { background: var(--accent); }
+.chip.no { color: var(--muted); }
+#wasmFile { word-break: break-all; }
+
+/* 執行方式 */
+.backends { display: grid; grid-template-columns: 1fr 1fr; gap: 6px; }
+.backends button { display: flex; flex-direction: column; align-items: flex-start; gap: 2px; padding: 10px; text-align: left; }
+.backends b { font-size: 14px; }
+.backends span { color: var(--muted); font-size: 11px; }
+.backends button[data-b=wasm].on { border-color: var(--wasm); background: color-mix(in srgb, var(--wasm) 16%, var(--panel2)); }
+.backends button[data-b=webgpu].on { border-color: var(--gpu); background: color-mix(in srgb, var(--gpu) 16%, var(--panel2)); }
+.threads { display: grid; grid-template-columns: auto 1fr; align-items: center; gap: 10px; }
+.threads label { color: var(--muted); font-size: 12px; }
+
+/* 即時效能 */
+.big { display: grid; grid-template-columns: 1fr 1fr; gap: 8px; }
+.big div { background: var(--panel2); border: 1px solid var(--line); border-radius: 8px; padding: 8px 10px; }
+.big b { display: block; font: 700 24px var(--mono); font-variant-numeric: tabular-nums; }
+.big span { color: var(--muted); font-size: 11px; }
+.pipe-bar { display: flex; height: 10px; border-radius: 5px; overflow: hidden; background: var(--panel2); }
+.pipe-bar i { display: block; height: 100%; width: 0; transition: width .3s; }
+.pipe-bar i + i { border-left: 1px solid var(--panel); }
+:is(.pipe-bar i, .sw).js { background: var(--js); }
+:is(.pipe-bar i, .sw).js2 { background: var(--js2); }
+:is(.pipe-bar i, .sw).wasm { background: var(--wasm); }
+:is(.pipe-bar i, .sw).gpu { background: var(--gpu); }
+dl { display: grid; grid-template-columns: 1fr auto; gap: 4px 10px; margin: 8px 0 0; }
+dt { color: var(--muted); display: flex; align-items: center; gap: 6px; }
+dd { margin: 0; text-align: right; font-family: var(--mono); font-variant-numeric: tabular-nums; }
+.sw { display: inline-block; width: 9px; height: 9px; border-radius: 2px; }
+
+/* 效能比較 */
+.bench { display: flex; flex-direction: column; gap: 8px; }
+.bench:empty { display: none; }
+.bench-row { display: grid; grid-template-columns: 1fr auto; gap: 3px 8px; align-items: baseline; }
+.bench-row .name { font-size: 12px; }
+.bench-row .val { font: 12px var(--mono); font-variant-numeric: tabular-nums; text-align: right; }
+.bench-row .val small { color: var(--muted); }
+.bench-row .track { grid-column: 1 / -1; height: 8px; border-radius: 4px; background: var(--panel2); overflow: hidden; }
+.bench-row .track i { display: block; height: 100%; border-radius: 4px; }
+.bench-row.wasm .track i { background: var(--wasm); }
+.bench-row.webgpu .track i { background: var(--gpu); }
+.bench-row .x { color: var(--accent); font-weight: 700; margin-left: 4px; }
+
+/* 物件清單、模型 */
+#objects { display: flex; flex-direction: column; gap: 4px; }
+#objects div { display: flex; justify-content: space-between; padding: 4px 8px; border-radius: 4px; background: var(--panel2); }
+#objects i { display: inline-block; width: 10px; height: 10px; border-radius: 2px; margin-right: 6px; vertical-align: -1px; }
+.modelname { font-size: 12px; word-break: break-all; }
+
+@media (max-width: 760px) {
+  .app { grid-template-columns: 1fr; grid-template-rows: 45vh auto; grid-template-rows: 45dvh auto; height: auto; }
+  aside { border-left: 0; border-top: 1px solid var(--line); }
+}
+@media (prefers-reduced-motion: reduce) { .pipe-bar i { transition: none; } }
