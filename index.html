@@ -4,7 +4,6 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>YOLO 鏡頭辨識</title>
-<script crossorigin="anonymous" src="https://cdn.jsdelivr.net/npm/onnxruntime-web@1.24.3/dist/ort.webgpu.min.js"></script>
 <link rel="stylesheet" href="style.css">
 </head>
 <body>
@@ -62,6 +61,8 @@
         <select id="threads"></select>
       </div>
       <div id="threadHint" class="hint">變更後會重新載入頁面（ONNX Runtime 初始化後就不能改）</div>
+      <label class="toggle"><input type="checkbox" id="simd"> <span>使用 SIMD 向量指令（較快；iPhone 若崩潰請關閉）</span></label>
+      <div id="simdHint" class="hint"></div>
     </section>
 
     <section>

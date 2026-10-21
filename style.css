@@ -72,6 +72,8 @@ input[type=range] { width: 100%; accent-color: var(--accent); }
 .backends button[data-b=webgpu].on { border-color: var(--gpu); background: color-mix(in srgb, var(--gpu) 16%, var(--panel2)); }
 .threads { display: grid; grid-template-columns: auto 1fr; align-items: center; gap: 10px; }
 .threads label { color: var(--muted); font-size: 12px; }
+.toggle { display: flex; align-items: center; gap: 8px; font-size: 12px; cursor: pointer; }
+.toggle input { width: 16px; height: 16px; margin: 0; accent-color: var(--wasm); }
 
 /* 即時效能 */
 .big { display: grid; grid-template-columns: 1fr 1fr; gap: 8px; }

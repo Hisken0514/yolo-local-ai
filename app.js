@@ -66,14 +66,29 @@ function namesFromOnnx(bytes) {
 //    執行緒數必須在第一次建立 session 前設定，之後要改只能重新整理頁面
 // ============================================================
 const THREADS = threads();
-ort.env.wasm.wasmPaths = 'https://cdn.jsdelivr.net/npm/onnxruntime-web@1.24.3/dist/';
+
+// SIMD 開關：ONNX Runtime 1.19 起只提供 SIMD 版的 .wasm，env.wasm.simd = false 不會有作用。
+// 所以關閉 SIMD 時改載入仍有「無 SIMD 版」的 1.18.0（預設關閉，iPhone 較不易崩潰）；開啟時用 1.24.3。
+// 1.18.0 沒有 inputMetadata，所以無法自動偵測輸入尺寸（用 640）和 fp16 模型。
+// 1.18.0 的 WebGPU 版程式只能搭配 SIMD 版 .wasm，所以無 SIMD 時載入純 Wasm 版（ort.min.js），不能用 WebGPU。
+const SIMD = getPref('wasm-simd') === '1';
+const ORT_VER = SIMD ? '1.24.3' : '1.18.0';
+const ORT_BASE = `https://cdn.jsdelivr.net/npm/onnxruntime-web@${ORT_VER}/dist/`;
+await new Promise((res, rej) => {
+  const s = document.createElement('script');
+  s.src = ORT_BASE + (SIMD ? 'ort.webgpu.min.js' : 'ort.min.js'); s.crossOrigin = 'anonymous';
+  s.onload = res; s.onerror = () => rej(new Error('ONNX Runtime 載入失敗'));
+  document.head.append(s);
+});
+ort.env.wasm.wasmPaths = ORT_BASE;
 ort.env.wasm.numThreads = THREADS;
+ort.env.wasm.simd = SIMD;
 
 let ENV = null;                                   // detectEnv() 的結果
 let session = null, switching = false;
 let backend = getPref('yolo-backend') || (navigator.gpu ? 'webgpu' : 'wasm');
 let prep, pctx, input;
-const backendLabel = b => b === 'webgpu' ? 'WebGPU' : `WebAssembly · ${THREADS} 執行緒`;
+const backendLabel = b => b === 'webgpu' ? 'WebGPU' : `WebAssembly · ${THREADS} 執行緒${SIMD ? '' : ' · 無 SIMD'}`;
 
 function inputSizeOf(s) {
   try {
@@ -300,7 +315,9 @@ async function openMedia(file) {
   const url = URL.createObjectURL(file);
   try {
     if (file.type.startsWith('image/')) {
-      const img = new Image(); img.src = url; await img.decode();
+      // 用 onload 而不是 img.decode()：decode() 在部分瀏覽器環境會一直不回應
+      const img = new Image();
+      await new Promise((res, rej) => { img.onload = res; img.onerror = () => rej(new Error('圖片格式不支援')); img.src = url; });
       stopCamera(); stopFile(); fileUrl = url;
       useSource(img, 'image');
     } else {
@@ -475,7 +492,7 @@ async function benchBackend(b, tag) {
 }
 
 function record(b, r) {
-  benchHist.push({ model: modelLabel, backend: b, threads: b === 'wasm' ? THREADS : 0, gpu: b === 'webgpu' ? ENV?.gpu || '' : '', median: r.median, runs: r.runs, at: Date.now() });
+  benchHist.push({ model: modelLabel, backend: b, threads: b === 'wasm' ? THREADS : 0, simd: b === 'wasm' ? SIMD : null, gpu: b === 'webgpu' ? ENV?.gpu || '' : '', median: r.median, runs: r.runs, at: Date.now() });
   benchHist = benchHist.slice(-40);
   setPref(BENCH_KEY, JSON.stringify(benchHist));
   renderBench();
@@ -485,12 +502,12 @@ async function runBenchmark() {
   if (benching || !modelBytes) return;
   benching = true; renderBenchButtons(); await pauseLoop();
   try {
-    const list = ['wasm', ...(ENV?.webgpu ? ['webgpu'] : [])], res = {};
+    const list = ['wasm', ...(ENV?.webgpu && SIMD ? ['webgpu'] : [])], res = {};
     for (const b of list) { res[b] = await benchBackend(b); record(b, res[b]); }
     if (res.webgpu) {
       const fast = res.webgpu.median < res.wasm.median ? 'webgpu' : 'wasm', slow = fast === 'wasm' ? 'webgpu' : 'wasm';
       setStatus(`${backendLabel(fast)} 比 ${backendLabel(slow)} 快 ${(res[slow].median / res[fast].median).toFixed(1)} 倍`);
-    } else setStatus(`${backendLabel('wasm')}：每次推論 ${res.wasm.median.toFixed(0)} ms（這個瀏覽器沒有 WebGPU 可比較）`);
+    } else setStatus(`${backendLabel('wasm')}：每次推論 ${res.wasm.median.toFixed(0)} ms（${SIMD ? '這個瀏覽器沒有 WebGPU 可比較' : '關閉 SIMD 時不能用 WebGPU'}）`);
   } catch (e) { setStatus('效能比較失敗：' + e.message, true); }
   benching = false; renderBenchButtons(); resumeLoop();
 }
@@ -547,8 +564,8 @@ function renderBackend() {
   $('wasmSub').textContent = `CPU · ${THREADS} 執行緒`;
   if (ENV) {
     const gpuBtn = document.querySelector('#backend [data-b=webgpu]');
-    gpuBtn.disabled = !ENV.webgpu;
-    $('gpuSub').textContent = ENV.webgpu ? (ENV.gpu || '顯示卡') : '這個瀏覽器不支援';
+    gpuBtn.disabled = !ENV.webgpu || !SIMD;
+    $('gpuSub').textContent = !SIMD ? '需先開啟 SIMD' : ENV.webgpu ? (ENV.gpu || '顯示卡') : '這個瀏覽器不支援';
   }
   const gpu = backend === 'webgpu';
   $('segInf').className = $('infSw').className = gpu ? 'gpu' : 'wasm';
@@ -637,13 +654,13 @@ function renderObjects() {
 // 每種設定只顯示最新一筆；長條越長越快，「×」= 比最慢的一種快幾倍
 function renderBench() {
   const latest = new Map();
-  for (const r of benchHist) if (r.model === modelLabel) latest.set(`${r.backend}|${r.threads}`, r);
+  for (const r of benchHist) if (r.model === modelLabel) latest.set(`${r.backend}|${r.threads}|${r.simd !== false}`, r);
   const rows = [...latest.values()].sort((a, b) => a.median - b.median);
   $('benchClear').hidden = !rows.length;
   if (!rows.length) { $('benchOut').innerHTML = ''; return; }
   const best = rows[0].median, worst = rows.at(-1).median;
   $('benchOut').innerHTML = rows.map(r => {
-    const label = r.backend === 'webgpu' ? `WebGPU${r.gpu ? ' · ' + esc(r.gpu) : ''}` : `WebAssembly · ${r.threads} 執行緒`;
+    const label = r.backend === 'webgpu' ? `WebGPU${r.gpu ? ' · ' + esc(r.gpu) : ''}` : `WebAssembly · ${r.threads} 執行緒${r.simd === false ? ' · 無 SIMD' : ''}`;
     const x = worst / r.median;
     return `<div class="bench-row ${r.backend}">
       <span class="name">${label}${rows.length > 1 && x >= 1.05 ? `<span class="x">×${x.toFixed(1)}</span>` : ''}</span>
@@ -724,6 +741,11 @@ $('backend').onclick = e => {
 };
 $('mode').onclick = e => { const b = e.target.closest('button'); if (b) switchMode(b.dataset.m); };
 $('threads').onchange = e => { setThreads(+e.target.value); location.reload(); };
+$('simd').checked = SIMD;
+$('simd').onchange = e => { setPref('wasm-simd', e.target.checked ? '1' : '0'); location.reload(); };
+$('simdHint').textContent = SIMD
+  ? `目前：ONNX Runtime ${ORT_VER}（SIMD 版）。`
+  : `目前：ONNX Runtime ${ORT_VER} 無 SIMD 版。較慢，但對 iPhone 較保險；不能用 WebGPU，也不支援自動偵測輸入尺寸與 fp16 模型。`;
 $('benchRun').onclick = runBenchmark;
 $('benchThreads').onclick = startThreadPlan;
 $('benchClear').onclick = () => { benchHist = benchHist.filter(r => r.model !== modelLabel); setPref(BENCH_KEY, JSON.stringify(benchHist)); renderBench(); };
@@ -734,7 +756,7 @@ $('benchClear').onclick = () => { benchHist = benchHist.filter(r => r.model !== 
 (async () => {
   if (await ensureIsolation()) return;            // GitHub Pages：註冊 service worker 後會重新整理一次
   ENV = await detectEnv();
-  if (backend === 'webgpu' && !ENV.webgpu) backend = 'wasm';
+  if (backend === 'webgpu' && (!ENV.webgpu || !SIMD)) backend = 'wasm';
   renderEnv($('env'), ENV, THREADS);
   renderThreads(); renderBackend(); renderBenchButtons();
   if (getSession(PLAN_KEY)) setStatus('比較執行緒數中，載入模型…', 'busy');
