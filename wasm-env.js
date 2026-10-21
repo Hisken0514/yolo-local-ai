@@ -31,9 +31,10 @@ export function threadChoices() {
   if (!self.crossOriginIsolated) return [1];
   return [...new Set([1, 2, 4, 8, 16, autoThreads].filter(n => n <= cores))].sort((a, b) => a - b);
 }
+// 預設 1 個執行緒（最穩定、最省電）；使用者在選單改過才用多執行緒
 export function threads() {
   const n = +getPref(THREADS_KEY);
-  return threadChoices().includes(n) ? n : self.crossOriginIsolated ? autoThreads : 1;
+  return threadChoices().includes(n) ? n : 1;
 }
 export function setThreads(n) { setPref(THREADS_KEY, n); }
 
