@@ -1,12 +1,12 @@
 import {
   ensureIsolation, detectEnv, renderEnv, renderWasmFiles, threads, threadChoices, setThreads,
-  getPref, setPref, getSession, setSession,
+  getPref, setPref, getSession, setSession, mb,
 } from './wasm-env.js';
 
 // ============================================================
-// 1. 模型來源：預設 YOLO11n（model.onnx），或使用者上傳（存在瀏覽器 IndexedDB，熱更新刷新後仍在）
+// 1. 模型來源：預設 YOLO26n（model.onnx），或使用者上傳（存在瀏覽器 IndexedDB，熱更新刷新後仍在）
 //    支援的輸出格式（自動判斷）：
-//      [1, 4+類別數, N]  YOLOv8 / YOLO11（預設）
+//      [1, 4+類別數, N]  YOLOv8 / YOLO11 / YOLO26（預設）
 //      [1, N, 4+類別數]  轉置版
 //      [1, N, 6]         已內建 NMS（x1,y1,x2,y2,score,class），N ≤ 1000
 // ============================================================
@@ -16,6 +16,7 @@ const DEFAULT_NAMES = ['人','腳踏車','汽車','機車','飛機','公車','�
   '三明治','柳橙','花椰菜','紅蘿蔔','熱狗','披薩','甜甜圈','蛋糕','椅子','沙發','盆栽','床','餐桌','馬桶','電視','筆電',
   '滑鼠','遙控器','鍵盤','手機','微波爐','烤箱','烤麵包機','水槽','冰箱','書','時鐘','花瓶','剪刀','泰迪熊','吹風機','牙刷'];
 
+const DEFAULT_LABEL = 'YOLO26n（預設，80 類）';
 let NAMES = DEFAULT_NAMES;
 let SIZE = 640;                                   // 模型輸入邊長，載入模型後自動偵測
 let modelBytes = null, modelLabel = '', outDims = null;
@@ -160,8 +161,99 @@ async function applyModel(bytes, names, label) {
 
 async function loadDefault() {
   const bytes = new Uint8Array(await (await fetch('model.onnx')).arrayBuffer());
-  return applyModel(bytes, DEFAULT_NAMES, 'YOLO11n（預設，80 類）');
+  return applyModel(bytes, DEFAULT_NAMES, DEFAULT_LABEL);
 }
+
+// 物件偵測模式：上次上傳的模型優先，否則用預設模型
+async function loadObjectsModel() {
+  const saved = await idbGet('model').catch(() => null);
+  let ok = false;
+  if (saved) ok = await applyModel(new Uint8Array(saved.bytes), saved.names?.length ? saved.names : null, saved.label);
+  if (!ok) ok = await loadDefault();
+  return ok;
+}
+
+// ============================================================
+// 2b. 年齡・性別模式（兩段式）：人臉偵測 → 每張臉裁成 224×224 → 年齡性別模型
+//     兩個模型都在執行時從 Hugging Face 下載，存在瀏覽器的 Cache Storage，不放進這個網站
+//     年齡性別模型輸出 [n, 2]：第 1 個值是歲數（四捨五入、限制 0~100），第 2 個值是女性機率（≥ 0.5 為女性）
+// ============================================================
+const FACE_URL = 'https://huggingface.co/AdamCodd/yolo11n-face-age/resolve/main/model.onnx';                // CC-BY-NC-4.0
+const AGE_URL = 'https://huggingface.co/onnx-community/age-gender-prediction-ONNX/resolve/main/onnx/model.onnx'; // Apache-2.0
+const FACE_LABEL = '人臉偵測 yolo11n-face-age';
+const FACE_NAMES = ['人臉', '人臉', '人臉'];   // 原本是 3 個年齡區間，這裡只拿來找臉
+const AGE_SIZE = 224, AGE_MAX_FACES = 6;
+const MEAN = [0.485, 0.456, 0.406], STD = [0.229, 0.224, 0.225];
+let mode = getPref('yolo-mode') === 'age' ? 'age' : 'objects';
+let ageSession = null, ageBytes = null, modeBusy = false;
+const ageCanvas = document.createElement('canvas'); ageCanvas.width = ageCanvas.height = AGE_SIZE;
+const actx = ageCanvas.getContext('2d', { willReadFrequently: true });
+
+async function cachedFetch(url, onProgress) {
+  let cache = null;
+  try {
+    cache = await caches.open('hf-models-v1');
+    const hit = await cache.match(url);
+    if (hit) return new Uint8Array(await hit.arrayBuffer());
+  } catch {}
+  const res = await fetch(url);
+  if (!res.ok) throw new Error(`下載失敗（HTTP ${res.status}）`);
+  const total = +res.headers.get('content-length') || 0, reader = res.body.getReader(), chunks = [];
+  let got = 0;
+  for (;;) { const { done, value } = await reader.read(); if (done) break; chunks.push(value); got += value.length; onProgress?.(got, total); }
+  const bytes = new Uint8Array(got); let o = 0;
+  for (const c of chunks) { bytes.set(c, o); o += c.length; }
+  try { await cache?.put(url, new Response(bytes)); } catch {}
+  return bytes;
+}
+
+async function createAgeSession(b) {
+  const s = await ort.InferenceSession.create(ageBytes, { executionProviders: [b], graphOptimizationLevel: 'all' });
+  await s.run({ pixel_values: new ort.Tensor('float32', new Float32Array(3 * AGE_SIZE * AGE_SIZE), [1, 3, AGE_SIZE, AGE_SIZE]) });
+  if (ageSession) await ageSession.release();
+  ageSession = s;
+}
+
+async function loadAgeMode() {
+  const bar = what => (got, total) => {
+    $('ageProgress').hidden = false; $('ageBar').style.width = total ? (got / total * 100) + '%' : '30%';
+    setStatus(`下載${what} ${mb(got)}${total ? ' / ' + mb(total) : ''}`, 'busy');
+  };
+  try {
+    const face = await cachedFetch(FACE_URL, bar('人臉模型'));
+    ageBytes = await cachedFetch(AGE_URL, bar('年齡模型'));
+    $('ageProgress').hidden = true;
+    if (!(await applyModel(face, FACE_NAMES, FACE_LABEL))) return false;
+    setStatus('建立年齡模型推論環境中…', 'busy');
+    try { await createAgeSession(backend); }
+    catch (e) { if (backend === 'wasm') throw e; await createAgeSession('wasm'); }
+    setStatus(`年齡・性別模式：${backendLabel(backend)}`);
+    return true;
+  } catch (e) {
+    $('ageProgress').hidden = true; ageBytes = null;
+    setStatus('年齡模式載入失敗：' + e.message, true);
+    return false;
+  }
+}
+
+// 每張臉往外多取 20% 再縮放成 224×224，正規化後一次批次推論
+async function runAge(faces) {
+  const list = faces.slice(0, AGE_MAX_FACES).filter(d => d.x2 > d.x1 && d.y2 > d.y1);
+  if (!list.length) return;
+  const n = list.length, area = AGE_SIZE * AGE_SIZE, data = new Float32Array(n * 3 * area);
+  const [vw, vh] = srcSize();
+  list.forEach((d, k) => {
+    const m = 0.2 * Math.max(d.x2 - d.x1, d.y2 - d.y1);
+    const x1 = Math.max(0, d.x1 - m), y1 = Math.max(0, d.y1 - m), x2 = Math.min(vw, d.x2 + m), y2 = Math.min(vh, d.y2 + m);
+    actx.drawImage(src.el, x1, y1, x2 - x1, y2 - y1, 0, 0, AGE_SIZE, AGE_SIZE);
+    const px = actx.getImageData(0, 0, AGE_SIZE, AGE_SIZE).data, off = k * 3 * area;
+    for (let i = 0; i < area; i++)
+      for (let c = 0; c < 3; c++) data[off + c * area + i] = (px[i * 4 + c] / 255 - MEAN[c]) / STD[c];
+  });
+  const out = (await ageSession.run({ pixel_values: new ort.Tensor('float32', data, [n, 3, AGE_SIZE, AGE_SIZE]) })).logits.data;
+  list.forEach((d, k) => { d.age = Math.min(100, Math.max(0, Math.round(out[k * 2]))); d.female = out[k * 2 + 1]; });
+}
+const genderOf = d => d.female >= 0.5 ? '女' : '男';
 
 // ============================================================
 // 3. 輸入來源：鏡頭、影片檔（循環播放）、圖片（同一張圖反覆推論，方便量測）
@@ -300,7 +392,11 @@ function draw() {
     const lw = Math.max(2, view.width / 400), fs = Math.max(14, view.width / 50);
     vctx.lineWidth = lw; vctx.font = `600 ${fs}px system-ui, sans-serif`; vctx.textBaseline = 'top';
     for (const d of dets) {
-      const col = color(d.cls), label = `${name(d.cls)} ${(d.score * 100).toFixed(0)}%`;
+      const aged = d.age != null;
+      const col = aged ? (d.female >= 0.5 ? 'hsl(330 85% 66%)' : 'hsl(200 85% 60%)') : color(d.cls);
+      const label = aged
+        ? `${d.age} 歲・${genderOf(d)} ${(Math.max(d.female, 1 - d.female) * 100).toFixed(0)}%`
+        : `${name(d.cls)} ${(d.score * 100).toFixed(0)}%`;
       vctx.strokeStyle = col; vctx.strokeRect(d.x1, d.y1, d.x2 - d.x1, d.y2 - d.y1);
       const tw = vctx.measureText(label).width + 10, ty = d.y1 > fs + 6 ? d.y1 - fs - 6 : d.y1;
       vctx.fillStyle = col; vctx.fillRect(d.x1 - lw / 2, ty, tw, fs + 6);
@@ -321,9 +417,15 @@ async function detectLoop() {
       const res = await s.run({ [s.inputNames[0]]: makeInput(input, SIZE, f16) });
       const out = toF32(res[s.outputNames[0]].data);
       const t2 = performance.now();
-      dets = s === session ? postprocess(out, +$('conf').value, meta) : [];
+      const found = s === session ? postprocess(out, +$('conf').value, meta) : [];
       const t3 = performance.now();
-      renderTimes(t1 - t0, t2 - t1, t3 - t2);
+      let tAge = 0;
+      if (mode === 'age' && ageSession && found.length) {
+        const ta = performance.now(); await runAge(found); tAge = performance.now() - ta;
+        $('tAge').textContent = `${(tAge / Math.min(found.length, AGE_MAX_FACES)).toFixed(0)} ms × ${Math.min(found.length, AGE_MAX_FACES)}`;
+      }
+      dets = found;
+      renderTimes(t1 - t0, t2 - t1 + tAge, t3 - t2);
       renderObjects();
       frames++;
     } catch (e) { setStatus('推論錯誤：' + e.message, true); }
@@ -491,10 +593,39 @@ function renderModel() {
   const nc = outDims ? (outDims[2] === 6 && outDims[1] <= 1000 ? NAMES.length : Math.min(outDims[1], outDims[2]) - 4) : NAMES.length;
   const hasNames = NAMES.length >= nc;
   $('modelName').textContent = `${modelLabel}${inF16 ? '（fp16）' : ''}　${nc} 類${hasNames ? '' : '（缺類別名稱，顯示為「類別 N」）'}`;
-  $('resetModel').hidden = modelLabel.startsWith('YOLO11n');
+  $('resetModel').hidden = modelLabel === DEFAULT_LABEL || mode === 'age';
+}
+
+function renderMode() {
+  document.querySelectorAll('#mode button').forEach(b => b.classList.toggle('on', b.dataset.m === mode));
+  $('modeHint').textContent = mode === 'age'
+    ? '先找出人臉，再估計歲數與性別（最多 6 張臉）。第一次會從 Hugging Face 下載約 355 MB，之後存在瀏覽器，建議用電腦。年齡平均誤差約 4.5 歲，12 歲以下較不準；人臉模型限非商業用途。拍攝他人前請先取得同意。'
+    : '偵測 80 類常見物品，也可以在下方上傳自己的 .onnx 模型。';
+  $('tAgeRow').hidden = $('tAge').hidden = mode !== 'age';
+}
+
+async function switchMode(m) {
+  if (m === mode || modeBusy || switching || benching) return;
+  modeBusy = true; await pauseLoop(); dets = [];
+  mode = m; setPref('yolo-mode', mode); renderMode();
+  if (mode === 'age') {
+    if (!(await loadAgeMode())) { mode = 'objects'; setPref('yolo-mode', mode); renderMode(); await loadObjectsModel(); }
+  } else {
+    if (ageSession) { await ageSession.release(); ageSession = null; }
+    ageBytes = null;
+    await loadObjectsModel();
+  }
+  renderModel(); renderObjects();
+  modeBusy = false; resumeLoop();
 }
 
 function renderObjects() {
+  if (mode === 'age') {
+    $('objects').innerHTML = dets.length
+      ? dets.map((d, i) => `<div><span>臉 ${i + 1}</span><b>${d.age != null ? `約 ${d.age} 歲・${genderOf(d)}` : '—'}</b></div>`).join('')
+      : '<div class="muted">沒有偵測到人臉</div>';
+    return;
+  }
   const count = {};
   for (const d of dets) count[d.cls] = (count[d.cls] || 0) + 1;
   const keys = Object.keys(count).sort((a, b) => count[b] - count[a]);
@@ -540,6 +671,11 @@ async function handleFiles(files) {
 
   const parsedNames = names ? parseNames(await names.text()) : null;
   if (model) {
+    if (mode === 'age') {                        // 上傳自己的模型時回到物件偵測模式
+      mode = 'objects'; setPref('yolo-mode', mode); renderMode();
+      if (ageSession) { await ageSession.release(); ageSession = null; }
+      ageBytes = null;
+    }
     setStatus(`載入 ${model.name}…`, 'busy');
     const bytes = new Uint8Array(await model.arrayBuffer());
     if (!(await applyModel(bytes, parsedNames, model.name))) return;
@@ -578,9 +714,15 @@ $('startCam').onclick = async () => {
 };
 $('camera').onchange = () => { if (stream) startCamera($('camera').value).catch(e => setStatus(e.message, true)); };
 $('backend').onclick = e => {
-  const b = e.target.closest('button'); if (!b || b.disabled || b.dataset.b === backend || switching || benching) return;
-  createSession(b.dataset.b);
+  const b = e.target.closest('button'); if (!b || b.disabled || b.dataset.b === backend || switching || benching || modeBusy) return;
+  createSession(b.dataset.b).then(async () => {
+    if (mode !== 'age' || !ageBytes) return;
+    await pauseLoop();
+    try { await createAgeSession(backend); } catch (err) { setStatus('年齡模型切換失敗：' + err.message, true); }
+    resumeLoop();
+  });
 };
+$('mode').onclick = e => { const b = e.target.closest('button'); if (b) switchMode(b.dataset.m); };
 $('threads').onchange = e => { setThreads(+e.target.value); location.reload(); };
 $('benchRun').onclick = runBenchmark;
 $('benchThreads').onclick = startThreadPlan;
@@ -597,10 +739,13 @@ $('benchClear').onclick = () => { benchHist = benchHist.filter(r => r.model !== 
   renderThreads(); renderBackend(); renderBenchButtons();
   if (getSession(PLAN_KEY)) setStatus('比較執行緒數中，載入模型…', 'busy');
 
-  const saved = await idbGet('model').catch(() => null);          // 上次上傳的模型優先
-  let ok = false;
-  if (saved) ok = await applyModel(new Uint8Array(saved.bytes), saved.names?.length ? saved.names : null, saved.label);
-  if (!ok) ok = await loadDefault();
+  renderMode();
+  let ok = mode === 'age' ? await loadAgeMode() : false;
+  if (!ok) {
+    if (mode === 'age') { mode = 'objects'; setPref('yolo-mode', mode); renderMode(); }
+    ok = await loadObjectsModel();
+  }
+  renderModel();
   if (!ok) return;
   draw(); detectLoop();
   await continueThreadPlan();

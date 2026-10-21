@@ -61,6 +61,8 @@ input[type=range] { width: 100%; accent-color: var(--accent); }
 .chip.no { color: var(--muted); }
 #wasmFile { word-break: break-all; }
 
+#mode button.on { border-color: var(--accent); background: color-mix(in srgb, var(--accent) 14%, var(--panel2)); font-weight: 700; }
+
 /* 執行方式 */
 .backends { display: grid; grid-template-columns: 1fr 1fr; gap: 6px; }
 .backends button { display: flex; flex-direction: column; align-items: flex-start; gap: 2px; padding: 10px; text-align: left; }
