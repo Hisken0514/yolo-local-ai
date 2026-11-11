@@ -1,0 +1,43 @@
+<!doctype html>
+<html lang="zh-Hant">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>YOLO VR 透視</title>
+<link rel="stylesheet" href="style.css">
+<style>
+  .xr { max-width: 760px; margin: 0 auto; padding: 16px; }
+  .xr h1 { font-size: 1.3rem; margin: 0 0 4px; }
+  .xr .row { display: flex; gap: 8px; flex-wrap: wrap; margin: 12px 0; }
+  .xr button { font-size: 1.05rem; padding: 12px 18px; }
+  .xr #checks { line-height: 1.8; font-size: .92rem; }
+  .xr #checks b { display: inline-block; min-width: 1.4em; }
+  .xr #preview { width: 100%; background: #000; border-radius: 8px; display: block; }
+  .xr .help { font-size: .85rem; opacity: .8; line-height: 1.7; }
+</style>
+</head>
+<body>
+<main class="xr">
+  <h1>YOLO VR 透視（Meta Quest 3）</h1>
+  <p class="help">戴上頭盔後，透過頭盔鏡頭看真實環境，辨識框標在你看的方向。轉頭時跟著辨識。</p>
+
+  <div id="checks">檢查中…</div>
+
+  <div class="row">
+    <button id="cam">① 開啟鏡頭</button>
+    <button id="enter" disabled>② 進入 VR 透視</button>
+  </div>
+  <div id="status" class="help"></div>
+
+  <canvas id="preview" width="640" height="480"></canvas>
+
+  <p class="help">
+    VR 中的操作：<br>
+    右搖桿上下：框的大小（對不準時調整）　左搖桿上下：框的高低　任一扳機：顯示／隱藏說明<br>
+    按頭盔的 Meta 鍵或 <kbd>Esc</kbd> 離開。
+  </p>
+  <p class="help"><a href="./">← 回 YOLO 主頁</a></p>
+</main>
+<script type="module" src="xr.js"></script>
+</body>
+</html>
