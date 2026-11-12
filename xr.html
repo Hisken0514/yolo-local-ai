@@ -19,7 +19,7 @@
 <body>
 <main class="xr">
   <h1>YOLO VR 透視（Meta Quest 3）</h1>
-  <p class="help">戴上頭盔後，透過頭盔鏡頭看真實環境，辨識框標在你看的方向。轉頭時跟著辨識。</p>
+  <p class="help">戴上頭盔後，透過頭盔鏡頭看真實環境；按扳機時拍下眼前畫面辨識，框標在你看的方向。</p>
 
   <div id="checks">檢查中…</div>
 
@@ -27,13 +27,19 @@
     <button id="cam">① 開啟鏡頭</button>
     <button id="enter" disabled>② 進入 VR 透視</button>
   </div>
+  <div class="row">
+    <button id="detObj" disabled>辨識物件（右扳機）</button>
+    <button id="detAge" disabled>辨識年齡（左扳機）</button>
+  </div>
   <div id="status" class="help"></div>
 
   <canvas id="preview" width="640" height="480"></canvas>
 
   <p class="help">
     VR 中的操作：<br>
-    右搖桿上下：框的大小（對不準時調整）　左搖桿上下：框的高低　任一扳機：顯示／隱藏說明<br>
+    右扳機：辨識物件　左扳機：辨識年齡・性別（第一次要下載約 355 MB）　握把：清除結果<br>
+    右搖桿上下：框的大小（對不準時調整）　左搖桿上下：框的高低　A 鍵：顯示／隱藏說明<br>
+    結果會固定在按下時看的方向，轉頭後框留在原處；不做即時偵測，比較省電。<br>
     按頭盔的 Meta 鍵或 <kbd>Esc</kbd> 離開。
   </p>
   <p class="help"><a href="./">← 回 YOLO 主頁</a></p>
